@@ -1,7 +1,7 @@
-//! nfq - NetFilter queue for Rust
+//! nfq - NetFilter queue for Rust (Async Version)
 //!
 //! `nfq` is Rust library for performing userspace handling of packets queued by the kernel packet
-//! packet filter chains.
+//! packet filter chains. This is the async version using tokio.
 //!
 //! # License
 //! In contrast to `libnetfilter_queue` which is licensed under GPL 2.0, which will require all
@@ -14,13 +14,14 @@
 //! ```no_run
 //! use nfq::{Queue, Verdict};
 //!
-//! fn main() -> std::io::Result<()> {
-//!    let mut queue = Queue::open()?;
-//!    queue.bind(0)?;
+//! #[tokio::main]
+//! async fn main() -> std::io::Result<()> {
+//!    let mut queue = Queue::open().await?;
+//!    queue.bind(0).await?;
 //!    loop {
-//!        let mut msg = queue.recv()?;
+//!        let mut msg = queue.recv().await?;
 //!        msg.set_verdict(Verdict::Accept);
-//!        queue.verdict(msg)?;
+//!        queue.verdict(msg).await?;
 //!    }
 //!    Ok(())
 //! }
@@ -32,7 +33,7 @@ use bytemuck::Zeroable;
 use bytes::{Buf, Bytes, BytesMut};
 use libc::{
     bind, c_int, recv, sendto, setsockopt, sockaddr_nl, socket, sysconf, AF_NETLINK, AF_UNSPEC,
-    EINTR, ENOSPC, MSG_DONTWAIT, MSG_TRUNC, NETLINK_NETFILTER, NETLINK_NO_ENOBUFS, NFNETLINK_V0,
+    EINTR, ENOSPC, MSG_TRUNC, NETLINK_NETFILTER, NETLINK_NO_ENOBUFS, NFNETLINK_V0,
     NFNL_SUBSYS_QUEUE, NFQA_CAP_LEN, NFQA_CFG_CMD, NFQA_CFG_FLAGS, NFQA_CFG_F_CONNTRACK,
     NFQA_CFG_F_FAIL_OPEN, NFQA_CFG_F_GSO, NFQA_CFG_F_SECCTX, NFQA_CFG_F_UID_GID, NFQA_CFG_MASK,
     NFQA_CFG_PARAMS, NFQA_CFG_QUEUE_MAXLEN, NFQA_CT, NFQA_CT_INFO, NFQA_GID, NFQA_HWADDR,
@@ -47,6 +48,7 @@ use std::collections::VecDeque;
 use std::io::Result;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, SystemTime};
+use tokio::io::unix::AsyncFd;
 
 use nlmsg::{
     NfGenMsg, NfqNlMsgPacketHdr, NfqNlMsgPacketHw, NfqNlMsgPacketTimestamp, NlMsgErr, NlMsgHdr,
@@ -464,12 +466,9 @@ fn parse_msg(mut bytes: BytesMut, queue: &mut Queue) {
 
 /// A NetFilter queue.
 pub struct Queue {
-    /// NetLink socket
-    fd: OwnedFd,
+    /// NetLink socket wrapped with AsyncFd for async operations
+    fd: AsyncFd<OwnedFd>,
 
-    /// Flag to send for recv operation. Decides whether or not the operation blocks until there is
-    /// message from the kernel.
-    recv_flag: libc::c_int,
     bufsize: usize,
 
     /// We can receive multiple messages from kernel in a single recv, so we keep a queue
@@ -488,17 +487,26 @@ fn metadata_size() -> usize {
 
 impl Queue {
     /// Open a NetFilter socket and queue connection.
-    pub fn open() -> std::io::Result<Queue> {
+    pub async fn open() -> std::io::Result<Queue> {
         let fd = unsafe { socket(PF_NETLINK, SOCK_RAW, NETLINK_NETFILTER) };
         if fd == -1 {
             return Err(std::io::Error::last_os_error());
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
+        // Set socket to non-blocking mode for async operations
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let async_fd = AsyncFd::new(fd)?;
         let metadata_size = metadata_size();
         let mut queue = Queue {
-            fd,
-            recv_flag: 0,
+            fd: async_fd,
             bufsize: metadata_size,
             queue: VecDeque::new(),
             verdict_buffer: BytesMut::with_capacity(metadata_size + 65536),
@@ -541,21 +549,34 @@ impl Queue {
         Ok(())
     }
 
-    fn send_nlmsg(&self, nlmsg: &[u8]) -> std::io::Result<()> {
-        unsafe {
-            let mut addr: sockaddr_nl = std::mem::zeroed();
-            addr.nl_family = AF_NETLINK as _;
-            if sendto(
-                self.fd.as_raw_fd(),
-                nlmsg.as_ptr() as _,
-                nlmsg.len() as _,
-                0,
-                &addr as *const sockaddr_nl as _,
-                std::mem::size_of_val(&addr) as _,
-            ) < 0
-            {
-                return Err(std::io::Error::last_os_error());
+    async fn send_nlmsg(&self, nlmsg: &[u8]) -> std::io::Result<()> {
+        loop {
+            let mut guard = self.fd.writable().await?;
+            
+            let result = unsafe {
+                let mut addr: sockaddr_nl = std::mem::zeroed();
+                addr.nl_family = AF_NETLINK as _;
+                sendto(
+                    self.fd.as_raw_fd(),
+                    nlmsg.as_ptr() as _,
+                    nlmsg.len() as _,
+                    libc::MSG_DONTWAIT,
+                    &addr as *const sockaddr_nl as _,
+                    std::mem::size_of_val(&addr) as _,
+                )
+            };
+            
+            if result < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    guard.clear_ready();
+                    continue;
+                }
+                return Err(err);
             }
+            
+            guard.retain_ready();
+            break;
         }
         Ok(())
     }
@@ -564,7 +585,7 @@ impl Queue {
     ///
     /// This method will set the copy range to 65535 by default. It can be changed by using
     /// [`set_copy_range`](#method.set_copy_range).
-    pub fn bind(&mut self, queue_num: u16) -> Result<()> {
+    pub async fn bind(&mut self, queue_num: u16) -> Result<()> {
         let mut nlmsg = nlmsg::NlmsgMut::with_capacity(metadata_size());
         nfq_hdr_put(&mut nlmsg, NFQNL_MSG_CONFIG as u16, queue_num, true);
         nlmsg.put(
@@ -576,13 +597,13 @@ impl Queue {
             },
         );
 
-        self.send_nlmsg(&nlmsg.finish())?;
-        self.recv_error()?;
-        self.set_copy_range(queue_num, 65535)
+        self.send_nlmsg(&nlmsg.finish()).await?;
+        self.recv_error().await?;
+        self.set_copy_range(queue_num, 65535).await
     }
 
     /// Set whether the kernel should drop or accept a packet if the queue is full.
-    pub fn set_fail_open(&mut self, queue_num: u16, enabled: bool) -> Result<()> {
+    pub async fn set_fail_open(&mut self, queue_num: u16, enabled: bool) -> Result<()> {
         let mut nlmsg = nlmsg::NlmsgMut::with_capacity(metadata_size());
         nfq_hdr_put(&mut nlmsg, NFQNL_MSG_CONFIG as u16, queue_num, true);
         nlmsg.put_be32(
@@ -594,12 +615,12 @@ impl Queue {
             },
         );
         nlmsg.put_be32(NFQA_CFG_MASK as u16, NFQA_CFG_F_FAIL_OPEN as u32);
-        self.send_nlmsg(&nlmsg.finish())?;
-        self.recv_error()
+        self.send_nlmsg(&nlmsg.finish()).await?;
+        self.recv_error().await
     }
 
     /// Set whether we should receive GSO-enabled and partial checksum packets.
-    pub fn set_recv_gso(&mut self, queue_num: u16, enabled: bool) -> Result<()> {
+    pub async fn set_recv_gso(&mut self, queue_num: u16, enabled: bool) -> Result<()> {
         let mut nlmsg = nlmsg::NlmsgMut::with_capacity(metadata_size());
         nfq_hdr_put(&mut nlmsg, NFQNL_MSG_CONFIG as u16, queue_num, true);
         nlmsg.put_be32(
@@ -607,12 +628,12 @@ impl Queue {
             if enabled { NFQA_CFG_F_GSO as u32 } else { 0 },
         );
         nlmsg.put_be32(NFQA_CFG_MASK as u16, NFQA_CFG_F_GSO as u32);
-        self.send_nlmsg(&nlmsg.finish())?;
-        self.recv_error()
+        self.send_nlmsg(&nlmsg.finish()).await?;
+        self.recv_error().await
     }
 
     /// Set whether we should receive UID/GID along with packets.
-    pub fn set_recv_uid_gid(&mut self, queue_num: u16, enabled: bool) -> Result<()> {
+    pub async fn set_recv_uid_gid(&mut self, queue_num: u16, enabled: bool) -> Result<()> {
         let mut nlmsg = nlmsg::NlmsgMut::with_capacity(metadata_size());
         nfq_hdr_put(&mut nlmsg, NFQNL_MSG_CONFIG as u16, queue_num, true);
         nlmsg.put_be32(
@@ -624,12 +645,12 @@ impl Queue {
             },
         );
         nlmsg.put_be32(NFQA_CFG_MASK as u16, NFQA_CFG_F_UID_GID as u32);
-        self.send_nlmsg(&nlmsg.finish())?;
-        self.recv_error()
+        self.send_nlmsg(&nlmsg.finish()).await?;
+        self.recv_error().await
     }
 
     /// Set whether we should receive security context strings along with packets.
-    pub fn set_recv_security_context(&mut self, queue_num: u16, enabled: bool) -> Result<()> {
+    pub async fn set_recv_security_context(&mut self, queue_num: u16, enabled: bool) -> Result<()> {
         let mut nlmsg = nlmsg::NlmsgMut::with_capacity(metadata_size());
         nfq_hdr_put(&mut nlmsg, NFQNL_MSG_CONFIG as u16, queue_num, true);
         nlmsg.put_be32(
@@ -637,13 +658,13 @@ impl Queue {
             if enabled { NFQA_CFG_F_SECCTX as u32 } else { 0 },
         );
         nlmsg.put_be32(NFQA_CFG_MASK as u16, NFQA_CFG_F_SECCTX as u32);
-        self.send_nlmsg(&nlmsg.finish())?;
-        self.recv_error()
+        self.send_nlmsg(&nlmsg.finish()).await?;
+        self.recv_error().await
     }
 
     /// Set whether we should receive conntrack information along with packets.
     #[cfg_attr(not(feature = "ct"), doc(hidden))]
-    pub fn set_recv_conntrack(&mut self, queue_num: u16, enabled: bool) -> Result<()> {
+    pub async fn set_recv_conntrack(&mut self, queue_num: u16, enabled: bool) -> Result<()> {
         let mut nlmsg = nlmsg::NlmsgMut::with_capacity(metadata_size());
         nfq_hdr_put(&mut nlmsg, NFQNL_MSG_CONFIG as u16, queue_num, true);
         nlmsg.put_be32(
@@ -655,8 +676,8 @@ impl Queue {
             },
         );
         nlmsg.put_be32(NFQA_CFG_MASK as u16, NFQA_CFG_F_CONNTRACK as u32);
-        self.send_nlmsg(&nlmsg.finish())?;
-        self.recv_error()
+        self.send_nlmsg(&nlmsg.finish()).await?;
+        self.recv_error().await
     }
 
     /// Set copy range. Packet larger than the specified range will be truncated. If the range
@@ -664,7 +685,7 @@ impl Queue {
     ///
     /// To get the original length of truncated packet, use
     /// [`Message::get_original_len`](struct.Message.html#method.get_original_len).
-    pub fn set_copy_range(&mut self, queue_num: u16, range: u16) -> Result<()> {
+    pub async fn set_copy_range(&mut self, queue_num: u16, range: u16) -> Result<()> {
         let mut nlmsg = nlmsg::NlmsgMut::with_capacity(metadata_size());
         nfq_hdr_put(&mut nlmsg, NFQNL_MSG_CONFIG as u16, queue_num, true);
         nlmsg.put(
@@ -678,8 +699,8 @@ impl Queue {
                 } as u8,
             },
         );
-        self.send_nlmsg(&nlmsg.finish())?;
-        self.recv_error()?;
+        self.send_nlmsg(&nlmsg.finish()).await?;
+        self.recv_error().await?;
 
         self.bufsize = metadata_size() + range as usize;
         Ok(())
@@ -687,21 +708,16 @@ impl Queue {
 
     /// Set the maximum kernel queue length. If the application cannot [`recv`](#method.recv) fast
     /// enough, newly queued packet will be dropped (or accepted if fail open is enabled).
-    pub fn set_queue_max_len(&mut self, queue_num: u16, len: u32) -> Result<()> {
+    pub async fn set_queue_max_len(&mut self, queue_num: u16, len: u32) -> Result<()> {
         let mut nlmsg = nlmsg::NlmsgMut::with_capacity(metadata_size());
         nfq_hdr_put(&mut nlmsg, NFQNL_MSG_CONFIG as u16, queue_num, true);
         nlmsg.put_be32(NFQA_CFG_QUEUE_MAXLEN as u16, len);
-        self.send_nlmsg(&nlmsg.finish())?;
-        self.recv_error()
-    }
-
-    /// Set whether the recv function blocks or not
-    pub fn set_nonblocking(&mut self, nonblocking: bool) {
-        self.recv_flag = if nonblocking { MSG_DONTWAIT } else { 0 };
+        self.send_nlmsg(&nlmsg.finish()).await?;
+        self.recv_error().await
     }
 
     /// Unbind from a specific queue number.
-    pub fn unbind(&mut self, queue_num: u16) -> Result<()> {
+    pub async fn unbind(&mut self, queue_num: u16) -> Result<()> {
         let mut nlmsg = nlmsg::NlmsgMut::with_capacity(metadata_size());
         nfq_hdr_put(&mut nlmsg, NFQNL_MSG_CONFIG as u16, queue_num, true);
         nlmsg.put(
@@ -712,30 +728,43 @@ impl Queue {
                 pf: 0,
             },
         );
-        self.send_nlmsg(&nlmsg.finish())?;
-        self.recv_error()
+        self.send_nlmsg(&nlmsg.finish()).await?;
+        self.recv_error().await
     }
 
     // Receive an nlmsg, using callback to process them. If Ok(true) is returned it means we got an
     // ACK.
-    fn recv_nlmsg(&mut self, mut callback: impl FnMut(&mut Self, BytesMut)) -> Result<bool> {
+    async fn recv_nlmsg(&mut self, mut callback: impl FnMut(&mut Self, BytesMut)) -> Result<bool> {
         let mut buf = BytesMut::with_capacity(self.bufsize + 3);
         let align_offset = (buf.as_ptr() as usize).wrapping_neg() % 4;
         if align_offset != 0 {
             buf = buf.split_off(align_offset);
         }
 
-        let size = unsafe {
-            recv(
-                self.fd.as_raw_fd(),
-                buf.as_mut_ptr() as _,
-                buf.capacity(),
-                self.recv_flag | MSG_TRUNC,
-            )
+        let size = loop {
+            let mut guard = self.fd.readable().await?;
+            
+            let result = unsafe {
+                recv(
+                    self.fd.as_raw_fd(),
+                    buf.as_mut_ptr() as _,
+                    buf.capacity(),
+                    MSG_TRUNC | libc::MSG_DONTWAIT,
+                )
+            };
+            
+            if result < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    guard.clear_ready();
+                    continue;
+                }
+                return Err(err);
+            }
+            
+            guard.retain_ready();
+            break result;
         };
-        if size < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
 
         // As we pass in MSG_TRUNC, if we receive a larger size it means the message is trucated
         let size = size as usize;
@@ -786,18 +815,18 @@ impl Queue {
 
     // Receive the next error message. Returns Ok only if errno is 0 (which is a response to a
     // message with F_ACK set).
-    fn recv_error(&mut self) -> Result<()> {
-        while !self.recv_nlmsg(|_, _| ())? {}
+    async fn recv_error(&mut self) -> Result<()> {
+        while !self.recv_nlmsg(|_, _| ()).await? {}
         Ok(())
     }
 
     /// Receive a packet from the queue.
-    pub fn recv(&mut self) -> Result<Message> {
+    pub async fn recv(&mut self) -> Result<Message> {
         // We have processed all messages in previous recv batch, do next iteration
         while self.queue.is_empty() {
             self.recv_nlmsg(|this, buf| {
                 parse_msg(buf, this);
-            })?;
+            }).await?;
         }
 
         let msg = self.queue.pop_front().unwrap();
@@ -805,7 +834,7 @@ impl Queue {
     }
 
     /// Verdict a message.
-    pub fn verdict(&mut self, msg: Message) -> Result<()> {
+    pub async fn verdict(&mut self, msg: Message) -> Result<()> {
         let buffer = core::mem::take(&mut self.verdict_buffer);
         let mut nlmsg = NlmsgMut::new(buffer);
         nfq_hdr_put(&mut nlmsg, NFQNL_MSG_VERDICT as u16, msg.id, false);
@@ -832,7 +861,7 @@ impl Queue {
             }
         }
         let buffer = nlmsg.finish();
-        let ret = self.send_nlmsg(&buffer);
+        let ret = self.send_nlmsg(&buffer).await;
         self.verdict_buffer = buffer;
         ret
     }
