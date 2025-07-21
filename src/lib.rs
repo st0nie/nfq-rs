@@ -32,17 +32,17 @@ mod nlmsg;
 use bytemuck::Zeroable;
 use bytes::{Buf, Bytes, BytesMut};
 use libc::{
-    bind, c_int, recv, sendto, setsockopt, sockaddr_nl, socket, sysconf, AF_NETLINK, AF_UNSPEC,
-    EINTR, ENOSPC, MSG_TRUNC, NETLINK_NETFILTER, NETLINK_NO_ENOBUFS, NFNETLINK_V0,
-    NFNL_SUBSYS_QUEUE, NFQA_CAP_LEN, NFQA_CFG_CMD, NFQA_CFG_FLAGS, NFQA_CFG_F_CONNTRACK,
-    NFQA_CFG_F_FAIL_OPEN, NFQA_CFG_F_GSO, NFQA_CFG_F_SECCTX, NFQA_CFG_F_UID_GID, NFQA_CFG_MASK,
-    NFQA_CFG_PARAMS, NFQA_CFG_QUEUE_MAXLEN, NFQA_CT, NFQA_CT_INFO, NFQA_GID, NFQA_HWADDR,
-    NFQA_IFINDEX_INDEV, NFQA_IFINDEX_OUTDEV, NFQA_IFINDEX_PHYSINDEV, NFQA_IFINDEX_PHYSOUTDEV,
-    NFQA_MARK, NFQA_PACKET_HDR, NFQA_PAYLOAD, NFQA_SECCTX, NFQA_SKB_CSUMNOTREADY, NFQA_SKB_GSO,
-    NFQA_SKB_INFO, NFQA_TIMESTAMP, NFQA_UID, NFQA_VERDICT_HDR, NFQNL_CFG_CMD_BIND,
-    NFQNL_CFG_CMD_UNBIND, NFQNL_COPY_META, NFQNL_COPY_PACKET, NFQNL_MSG_CONFIG, NFQNL_MSG_VERDICT,
-    NLMSG_DONE, NLMSG_ERROR, NLMSG_MIN_TYPE, NLM_F_ACK, NLM_F_DUMP_INTR, NLM_F_REQUEST, PF_NETLINK,
-    SOCK_RAW, SOL_NETLINK, _SC_PAGE_SIZE,
+    _SC_PAGE_SIZE, AF_NETLINK, AF_UNSPEC, EINTR, ENOSPC, MSG_TRUNC, NETLINK_NETFILTER,
+    NETLINK_NO_ENOBUFS, NFNETLINK_V0, NFNL_SUBSYS_QUEUE, NFQA_CAP_LEN, NFQA_CFG_CMD,
+    NFQA_CFG_F_CONNTRACK, NFQA_CFG_F_FAIL_OPEN, NFQA_CFG_F_GSO, NFQA_CFG_F_SECCTX,
+    NFQA_CFG_F_UID_GID, NFQA_CFG_FLAGS, NFQA_CFG_MASK, NFQA_CFG_PARAMS, NFQA_CFG_QUEUE_MAXLEN,
+    NFQA_CT, NFQA_CT_INFO, NFQA_GID, NFQA_HWADDR, NFQA_IFINDEX_INDEV, NFQA_IFINDEX_OUTDEV,
+    NFQA_IFINDEX_PHYSINDEV, NFQA_IFINDEX_PHYSOUTDEV, NFQA_MARK, NFQA_PACKET_HDR, NFQA_PAYLOAD,
+    NFQA_SECCTX, NFQA_SKB_CSUMNOTREADY, NFQA_SKB_GSO, NFQA_SKB_INFO, NFQA_TIMESTAMP, NFQA_UID,
+    NFQA_VERDICT_HDR, NFQNL_CFG_CMD_BIND, NFQNL_CFG_CMD_UNBIND, NFQNL_COPY_META, NFQNL_COPY_PACKET,
+    NFQNL_MSG_CONFIG, NFQNL_MSG_VERDICT, NLM_F_ACK, NLM_F_DUMP_INTR, NLM_F_REQUEST, NLMSG_DONE,
+    NLMSG_ERROR, NLMSG_MIN_TYPE, PF_NETLINK, SOCK_RAW, SOL_NETLINK, bind, c_int, recv, sendto,
+    setsockopt, sockaddr_nl, socket, sysconf,
 };
 use std::collections::VecDeque;
 use std::io::Result;
@@ -51,9 +51,9 @@ use std::time::{Duration, SystemTime};
 use tokio::io::unix::AsyncFd;
 
 use nlmsg::{
-    NfGenMsg, NfqNlMsgPacketHdr, NfqNlMsgPacketHw, NfqNlMsgPacketTimestamp, NlMsgErr, NlMsgHdr,
-    NlmsgMut, CTA_ID, IP_CT_ESTABLISHED, IP_CT_ESTABLISHED_REPLY, IP_CT_NEW, IP_CT_NEW_REPLY,
-    IP_CT_RELATED, IP_CT_RELATED_REPLY,
+    CTA_ID, IP_CT_ESTABLISHED, IP_CT_ESTABLISHED_REPLY, IP_CT_NEW, IP_CT_NEW_REPLY, IP_CT_RELATED,
+    IP_CT_RELATED_REPLY, NfGenMsg, NfqNlMsgPacketHdr, NfqNlMsgPacketHw, NfqNlMsgPacketTimestamp,
+    NlMsgErr, NlMsgHdr, NlmsgMut,
 };
 
 /// Decision made on a specific packet.
@@ -552,7 +552,7 @@ impl Queue {
     async fn send_nlmsg(&self, nlmsg: &[u8]) -> std::io::Result<()> {
         loop {
             let mut guard = self.fd.writable().await?;
-            
+
             let result = unsafe {
                 let mut addr: sockaddr_nl = std::mem::zeroed();
                 addr.nl_family = AF_NETLINK as _;
@@ -560,12 +560,12 @@ impl Queue {
                     self.fd.as_raw_fd(),
                     nlmsg.as_ptr() as _,
                     nlmsg.len() as _,
-                    libc::MSG_DONTWAIT,
+                    0,
                     &addr as *const sockaddr_nl as _,
                     std::mem::size_of_val(&addr) as _,
                 )
             };
-            
+
             if result < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::WouldBlock {
@@ -574,7 +574,7 @@ impl Queue {
                 }
                 return Err(err);
             }
-            
+
             guard.retain_ready();
             break;
         }
@@ -743,16 +743,16 @@ impl Queue {
 
         let size = loop {
             let mut guard = self.fd.readable().await?;
-            
+
             let result = unsafe {
                 recv(
                     self.fd.as_raw_fd(),
                     buf.as_mut_ptr() as _,
                     buf.capacity(),
-                    MSG_TRUNC | libc::MSG_DONTWAIT,
+                    MSG_TRUNC,
                 )
             };
-            
+
             if result < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::WouldBlock {
@@ -761,7 +761,7 @@ impl Queue {
                 }
                 return Err(err);
             }
-            
+
             guard.retain_ready();
             break result;
         };
@@ -826,7 +826,8 @@ impl Queue {
         while self.queue.is_empty() {
             self.recv_nlmsg(|this, buf| {
                 parse_msg(buf, this);
-            }).await?;
+            })
+            .await?;
         }
 
         let msg = self.queue.pop_front().unwrap();
